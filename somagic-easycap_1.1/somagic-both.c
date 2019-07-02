@@ -51,6 +51,25 @@
 #define NUM_ISO_TRANSFERS 20
 #define NUM_ISO_SND_TRANSFERS 16
 
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+static int fvideo = STDOUT_FILENO;
+static int faudio = STDERR_FILENO;
+static char *video_path = 0;
+static char *audio_path = 0;
+
+void close_files(void) {
+	if (fvideo > 2) {
+		close(fvideo);
+		fvideo = 0;
+	}
+	if (faudio > 2) {
+		close(faudio);
+		faudio = 0;
+	}
+}
+
 struct libusb_transfer *vid_free[NUM_ISO_TRANSFERS];
 
 int vid_free_item = 0;
@@ -312,7 +331,7 @@ static void process(struct video_state_t *vs, uint8_t c)
 
 			if (vs->field == 0 && field_edge) {
 				if (frames_generated < frame_count || frame_count == -1) {
-					write(1, frame, 720 * 2 * lines_per_field * 2);
+					write(fvideo, frame, 720 * 2 * lines_per_field * 2);
 					frames_generated++;
 				}
 				
@@ -432,7 +451,7 @@ void gotdata(struct libusb_transfer *tfr)
 			} else if (data[pos] == 0xaa && data[pos + 1] == 0xaa && data[pos + 2] == 0x00 &&  data[pos + 3] == 0x01 ) {
 				/* blocks [0xaa 0xaa 0x00 0x01 are AUDIO blocks (when device setup correctly) 
 				 write these to fd #2 (stderr)*/
-				write( 2, data +4 , 0x400 - 4);
+				write(faudio, data +4 , 0x400 - 4);
 				
 			} else {
  				fprintf(stderr, "Unexpected block, expected [aa aa 00 00/01] found [%02x %02x %02x %02x]\n", data[pos], data[pos + 1], data[pos + 2], data[pos + 3]);
@@ -634,6 +653,8 @@ void usage()
 	fprintf(stderr, "                              -128  -2.000000 (inverse)\n");
 	fprintf(stderr, "  -s, --s-video              Use S-VIDEO input\n");
 	fprintf(stderr, "      --secam                SECAM             [625 lines, 25 Hz]\n");
+	fprintf(stderr, "  -a, --audio=FILE           Output file for audio (default: stderr)\n");
+	fprintf(stderr, "  -v, --video=FILE           Output file for video (default: stdout)\n");
 	fprintf(stderr, "      --help                 Display usage\n");
 	fprintf(stderr, "      --version              Display version information\n");
 	fprintf(stderr, "\n");
@@ -692,12 +713,14 @@ int main(int argc, char **argv)
 		{"pal", 0, 0, 'p'},
 		{"s-video", 0, 0, 's'},
 		{"saturation", 1, 0, 'S'},
+		{"faudio", 1, 0, 'a'},
+		{"fvideo", 1, 0, 'v'},
 		{0, 0, 0, 0}
 	};
 
 	/* parse command line arguments */
 	while (1) {
-		c = getopt_long(argc, argv, "B:cC:f:H:npsS:", long_options, &option_index);
+		c = getopt_long(argc, argv, "B:cC:f:H:npsS:a:v:", long_options, &option_index);
 		if (c == -1) {
 			break;
 		}
@@ -800,6 +823,12 @@ int main(int argc, char **argv)
 			}
 			saturation = (int8_t)i;
 			break;
+		case 'a':
+			audio_path = optarg;
+			break;
+		case 'v':
+			video_path = optarg;
+			break;
 		default:
 			usage();
 			return 1;
@@ -812,6 +841,23 @@ int main(int argc, char **argv)
 	if (input_type == SVIDEO && luminance_mode != 0) {
 		fprintf(stderr, "Luminance mode must be 0 for S-VIDEO\n");
 		return 1;
+	}
+
+	if (audio_path != 0) {
+		faudio = open(audio_path, O_WRONLY);
+		if (faudio == -1) {
+			fprintf(stderr, "Failed to open audio output file!\n");
+			return 1;
+		}
+		atexit(close_files);
+	}
+	if (video_path != 0) {
+		fvideo = open(video_path, O_WRONLY);
+		if (fvideo == -1) {
+			fprintf(stderr, "Failed to open video output file!\n");
+			return 1;
+		}
+		atexit(close_files);
 	}
 
 	libusb_init(NULL);
