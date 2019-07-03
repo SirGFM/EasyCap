@@ -54,19 +54,80 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
-static int fvideo = STDOUT_FILENO;
-static int faudio = STDERR_FILENO;
-static char *video_path = 0;
-static char *audio_path = 0;
+#include <stdint.h>
+#include <unistd.h>
+#include <pthread.h>
+#include <signal.h>
+#include <errno.h>
+
+/* This was worst case scenario is for SECAM (625 lines) */
+#define MAX_LINE_PER_FIELD 627
+/* ~1.7 MB per frame */
+#define FRAME_SIZE(LINE_PER_FIELD) (720 * 2 * LINE_PER_FIELD * 2)
+#define AUDIO_SIZE (0x400 - 4)
+
+#define BUFFER_SIZE 16
+/* ~27.6 MB for the video buffer */
+static uint8_t video_buffer[BUFFER_SIZE * FRAME_SIZE(MAX_LINE_PER_FIELD)];
+/* ~16 KB for the audio buffer */
+static uint8_t audio_buffer[BUFFER_SIZE * AUDIO_SIZE];
+
+struct thread_data {
+	char *file_path;
+	uint8_t *buffer[BUFFER_SIZE];
+	int fd;
+	int data_size;
+	pthread_t id;
+	volatile uint8_t prod;
+	volatile uint8_t cons;
+	volatile uint8_t ok;
+};
+static struct thread_data audio_data;
+static struct thread_data video_data;
+
+void got_signal(int sig) {
+	if (sig == SIGINT)
+		exit(0);
+}
+
+void *consume_data(void *arg) {
+	struct thread_data *data = (struct thread_data*)arg;
+
+	if (data->file_path != 0) {
+		int fd = open(data->file_path, O_WRONLY);
+		if (fd == -1)
+			fprintf(stderr,
+					"Failed to open %s. Keeping default output...!\n",
+					data->file_path);
+		else
+			data->fd = fd;
+	}
+
+	/* Synchronize audio and video */
+	data->ok = 1;
+	while (!video_data.ok && ! audio_data.ok)
+		usleep(8000);
+
+	do {
+		while (data->prod - data->cons == 0)
+			usleep(8000);
+		int n = write(data->fd,
+					  data->buffer[data->cons % BUFFER_SIZE],
+					  data->data_size);
+		if (n == -1)
+			perror(data->file_path);
+		++data->cons;
+	} while (1);
+}
 
 void close_files(void) {
-	if (fvideo > 2) {
-		close(fvideo);
-		fvideo = 0;
+	if (video_data.fd > 2) {
+		close(video_data.fd);
+		video_data.fd = 0;
 	}
-	if (faudio > 2) {
-		close(faudio);
-		faudio = 0;
+	if (audio_data.fd > 2) {
+		close(audio_data.fd);
+		audio_data.fd = 0;
 	}
 }
 
@@ -77,7 +138,6 @@ int vid_free_item = 0;
 int frames_generated = 0;
 int stop_sending_requests = 0;
 int pending_requests = 0;
-int lines_per_field;
 
 struct libusb_device_handle *devh;
 
@@ -225,7 +285,7 @@ struct video_state_t {
 
 static struct video_state_t vs = { .line = 0, .col = 0, .state = 0, .field = 0, .blank = 0};
 
-unsigned char frame[720 * 2 * 627 * 2] = { 0 };
+unsigned char *frame = (unsigned char*)video_buffer;
 
 static void put_data(struct video_state_t *vs, uint8_t c)
 {
@@ -331,7 +391,9 @@ static void process(struct video_state_t *vs, uint8_t c)
 
 			if (vs->field == 0 && field_edge) {
 				if (frames_generated < frame_count || frame_count == -1) {
-					write(fvideo, frame, 720 * 2 * lines_per_field * 2);
+					if (video_data.ok && audio_data.ok)
+						++video_data.prod;
+					frame = video_data.buffer[video_data.prod % BUFFER_SIZE];
 					frames_generated++;
 				}
 				
@@ -449,10 +511,12 @@ void gotdata(struct libusb_transfer *tfr)
 					process(&vs, data[k + pos]);
 				}
 			} else if (data[pos] == 0xaa && data[pos + 1] == 0xaa && data[pos + 2] == 0x00 &&  data[pos + 3] == 0x01 ) {
-				/* blocks [0xaa 0xaa 0x00 0x01 are AUDIO blocks (when device setup correctly) 
-				 write these to fd #2 (stderr)*/
-				write(faudio, data +4 , 0x400 - 4);
-				
+				/* blocks [0xaa 0xaa 0x00 0x01 are AUDIO blocks (when device setup correctly) */
+				memcpy(audio_data.buffer[audio_data.prod % BUFFER_SIZE],
+					   data+4,
+					   AUDIO_SIZE);
+				if (video_data.ok && audio_data.ok)
+					++audio_data.prod;
 			} else {
  				fprintf(stderr, "Unexpected block, expected [aa aa 00 00/01] found [%02x %02x %02x %02x]\n", data[pos], data[pos + 1], data[pos + 2], data[pos + 3]);
 			}
@@ -718,6 +782,9 @@ int main(int argc, char **argv)
 		{0, 0, 0, 0}
 	};
 
+	audio_data.file_path = 0;
+	video_data.file_path = 0;
+
 	/* parse command line arguments */
 	while (1) {
 		c = getopt_long(argc, argv, "B:cC:f:H:npsS:a:v:", long_options, &option_index);
@@ -824,10 +891,10 @@ int main(int argc, char **argv)
 			saturation = (int8_t)i;
 			break;
 		case 'a':
-			audio_path = optarg;
+			audio_data.file_path = optarg;
 			break;
 		case 'v':
-			video_path = optarg;
+			video_data.file_path = optarg;
 			break;
 		default:
 			usage();
@@ -843,21 +910,40 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	if (audio_path != 0) {
-		faudio = open(audio_path, O_WRONLY);
-		if (faudio == -1) {
-			fprintf(stderr, "Failed to open audio output file!\n");
-			return 1;
+	audio_data.fd = STDERR_FILENO;
+	audio_data.prod = 0;
+	audio_data.cons = 0;
+	audio_data.ok = 0;
+	audio_data.data_size = AUDIO_SIZE;
+	video_data.fd = STDOUT_FILENO;
+	video_data.prod = 0;
+	video_data.cons = 0;
+	video_data.ok = 0;
+
+	do {
+		int i;
+		for (i = 0; i < BUFFER_SIZE; i++) {
+			video_data.buffer[i] = &video_buffer[i * FRAME_SIZE(MAX_LINE_PER_FIELD)];
+			audio_data.buffer[i] = &audio_buffer[i * AUDIO_SIZE];
 		}
-		atexit(close_files);
+	} while (0);
+
+	signal(SIGINT, got_signal);
+
+	atexit(close_files);
+	if (0 != pthread_create(&audio_data.id,
+							0,
+							consume_data,
+							(void*)&audio_data)) {
+		fprintf(stderr, "Failed to start audio consumer thread\n");
+		return 1;
 	}
-	if (video_path != 0) {
-		fvideo = open(video_path, O_WRONLY);
-		if (fvideo == -1) {
-			fprintf(stderr, "Failed to open video output file!\n");
-			return 1;
-		}
-		atexit(close_files);
+	if (0 != pthread_create(&video_data.id,
+							0,
+							consume_data,
+							(void*)&video_data)) {
+		fprintf(stderr, "Failed to start video consumer thread\n");
+		return 1;
 	}
 
 	libusb_init(NULL);
@@ -1176,11 +1262,11 @@ int main(int argc, char **argv)
 	if (tv_standard == PAL || tv_standard == PAL_COMBO_N || tv_standard == NTSC_N || tv_standard == SECAM) {
 		/* Slicer set, Vertical offset = Value for 625 lines input */
 		somagic_write_i2c(0x4a, 0x5a, 0x07);
-		lines_per_field = 288;
+		video_data.data_size = FRAME_SIZE(288);
 	} else {
 		/* Slicer set, Vertical offset = Value for 525 lines input */
 		somagic_write_i2c(0x4a, 0x5a, 0x0a);
-		lines_per_field = 240;
+		video_data.data_size = FRAME_SIZE(240);
 	}
 
 	/* Subaddress 0x5b, Field offset, MSBs for vertical and horizontal offsets/HVOFF */

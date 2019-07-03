@@ -31,7 +31,7 @@ PROGRAMS = somagic-init somagic-capture
 BETA = somagic-audio-capture somagic-both
 MANUALS = man/somagic-init.1 man/somagic-capture.1
 CFLAGS = -s -W -Wall
-LFLAGS = -lusb-1.0 -lgcrypt
+LFLAGS = -lusb-1.0 -lgcrypt -pthread
 
 .SUFFIXES:
 .SUFFIXES: .c
