@@ -1,0 +1,12 @@
+version: "3.8"
+
+services:
+  video-cap:
+    container_name: "video-cap"
+    image: video-cap
+    build: ./docker
+    volumes:
+      - ".:/socap"
+      - "/dev/bus/usb:/dev/bus/usb"
+    privileged: true
+    command: /socap/run.sh
